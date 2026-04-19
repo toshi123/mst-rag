@@ -62,6 +62,7 @@ export OLLAMA_HOST="http://localhost:11434"
 
 - **Ollama**: 埋め込み・チャットで利用する場合、ローカルまたは指定ホストで Ollama が起動している必要があります。
 - **Chroma DB**: `CHROMA_DIR` に既存のインデックスが無い場合は、先に `scripts/build_index.py` や `scripts/sync_esa_to_chroma.py` などで構築する必要があります。
+  - DBの構築については [build_db.md](./docs/build_db.md) を参照のこと
 
 ### 5. アプリの起動例
 
