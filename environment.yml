@@ -1,0 +1,19 @@
+name: mst-rag-admin
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pandas
+  - pyyaml
+  - tqdm
+  - requests
+  - streamlit
+  - pip:
+      - chromadb
+      - pymupdf
+      - pymupdf4llm
+      - mcp
+      - google-api-python-client
+      - google-auth
+      - google-auth-httplib2
