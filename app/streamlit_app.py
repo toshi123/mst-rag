@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import html
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -44,6 +45,7 @@ TEXTS = {
         "project_id": "project_id",
         "retrieval": "Retrieval",
         "distance_cutoff_checkbox": "distance cutoff を使う",
+        "reranker_checkbox": "クロスエンコーダでリランク（要 sentence-transformers）",
         "generation": "Generation",
         "model": "生成モデル",
         "show_context": "コンテキストを表示",
@@ -104,6 +106,7 @@ TEXTS = {
         "project_id": "project_id",
         "retrieval": "Retrieval",
         "distance_cutoff_checkbox": "Use distance cutoff",
+        "reranker_checkbox": "Rerank with cross-encoder (requires sentence-transformers)",
         "generation": "Generation",
         "model": "Generation model",
         "show_context": "Show context",
@@ -293,11 +296,16 @@ def render_hit_card(hit: Dict[str, Any], idx: int, ui_language: str) -> None:
         title = meta.get("title", "") or "(untitled)"
         st.markdown(f"**[{idx}] {source_badge(source_type, ui_language)} {title}**")
 
-        cols = st.columns(4)
-        cols[0].write(f"distance: {hit.get('distance', '')}")
-        cols[1].write(f"collection: {collection_name}")
-        cols[2].write(f"source: {source_type}")
-        cols[3].write(f"rank_raw: {hit.get('rank_raw', '')}")
+        cols = st.columns(5)
+        cols[0].write(f"chroma_dist: {hit.get('chroma_distance', hit.get('distance', ''))}")
+        cols[1].write(
+            f"rerank: {hit['rerank_score']:.4f}"
+            if hit.get("rerank_score") is not None
+            else "rerank: —"
+        )
+        cols[2].write(f"collection: {collection_name}")
+        cols[3].write(f"source: {source_type}")
+        cols[4].write(f"rank_raw: {hit.get('rank_raw', '')}")
 
         if source_type == "pdf":
             st.write(f"format/year: {meta.get('format', '')} / {meta.get('year', '')}")
@@ -338,6 +346,7 @@ def run_retrieval(
     fmt: str,
     genre: str,
     project_id: str,
+    use_cross_encoder_rerank: bool,
 ) -> Dict[str, Any]:
     return retrieve_hits(
         query=query,
@@ -352,6 +361,7 @@ def run_retrieval(
         fmt=fmt or None,
         genre=genre or None,
         project_id=project_id or None,
+        use_cross_encoder_rerank=use_cross_encoder_rerank,
     )
 
 
@@ -369,6 +379,7 @@ def execute_search(
     fmt: str,
     genre: str,
     project_id: str,
+    use_cross_encoder_rerank: bool,
 ):
     result = run_retrieval(
         query=query,
@@ -384,6 +395,7 @@ def execute_search(
         fmt=fmt,
         genre=genre,
         project_id=project_id,
+        use_cross_encoder_rerank=use_cross_encoder_rerank,
     )
     final_hits = result["final_hits"]
     context = build_context(final_hits)
@@ -540,10 +552,14 @@ def main() -> None:
         project_id = st.text_input(t["project_id"], value="")
 
         st.subheader(t["retrieval"])
-        top_k = st.slider("top_k", min_value=1, max_value=15, value=8)
-        initial_k = st.slider("initial_k", min_value=top_k, max_value=50, value=max(24, top_k))
+        top_k = st.slider("top_k", min_value=1, max_value=25, value=8)
+        initial_k = st.slider("initial_k", min_value=top_k, max_value=100, value=max(24, top_k))
         use_distance_cutoff = st.checkbox(t["distance_cutoff_checkbox"], value=False)
         distance_cutoff = st.number_input("distance_cutoff", min_value=0.0, max_value=10.0, value=1.2, step=0.1)
+        use_cross_encoder_rerank = st.checkbox(
+            t["reranker_checkbox"],
+            value=os.environ.get("RERANK_ENABLED", "0") == "1",
+        )
         max_per_doc = st.slider("max_per_doc", min_value=1, max_value=5, value=2)
         max_per_project = st.slider("max_per_project", min_value=1, max_value=5, value=3)
         max_per_url = st.slider("max_per_url", min_value=1, max_value=5, value=2)
@@ -581,6 +597,7 @@ def main() -> None:
                         fmt=fmt,
                         genre=genre,
                         project_id=project_id,
+                        use_cross_encoder_rerank=use_cross_encoder_rerank,
                     )
 
             if run_answer or run_both:
@@ -609,6 +626,13 @@ def main() -> None:
             st.write(f"searched_collections: {result.get('searched_collections', [])}")
             if result.get("missing_collections"):
                 st.warning(f"missing_collections: {result['missing_collections']}")
+            if result.get("rerank_requested"):
+                applied = result.get("rerank_applied")
+                rm = result.get("rerank_model") or ""
+                st.caption(
+                    f"rerank: {'OK' if applied else 'skipped (install sentence-transformers or check model)'} "
+                    f"model={rm}"
+                )
 
         if answer:
             st.subheader(t["rag_answer"])

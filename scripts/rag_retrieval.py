@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,6 +19,39 @@ DEFAULT_COLLECTIONS = ["mst_research", "esa_posts"]
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 EMBED_MODEL = "embeddinggemma"
+
+DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-base"
+_CROSS_ENCODER_CACHE: Dict[str, Any] = {}
+_RERANKER_RUNTIME_CONFIGURED = False
+
+
+def _configure_reranker_runtime_quiet() -> None:
+    """
+    CrossEncoder 初回ロード時の HF Hub / transformers の進捗・冗長ログを抑える。
+    （未認証警告は HF_TOKEN で解消するのが本筋。ここではコンソールのノイズを減らす。）
+    """
+    global _RERANKER_RUNTIME_CONFIGURED
+    if _RERANKER_RUNTIME_CONFIGURED:
+        return
+    _RERANKER_RUNTIME_CONFIGURED = True
+
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*[Uu]nauthenticated requests.*",
+    )
+
+    for name in ("huggingface_hub", "transformers", "sentence_transformers", "torch"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+    try:
+        import transformers
+
+        transformers.logging.set_verbosity_error()
+    except Exception:
+        pass
 
 
 def sanitize_filter_value(value: Optional[str]) -> Optional[str]:
@@ -215,12 +251,58 @@ def numeric_doc_priority(meta: Dict[str, Any]) -> int:
         return 0
 
 
+def get_cross_encoder(model_name: str):
+    if model_name in _CROSS_ENCODER_CACHE:
+        return _CROSS_ENCODER_CACHE[model_name]
+    _configure_reranker_runtime_quiet()
+    try:
+        from sentence_transformers import CrossEncoder
+    except Exception:
+        _CROSS_ENCODER_CACHE[model_name] = None
+        return None
+    try:
+        model = CrossEncoder(model_name)
+    except Exception:
+        _CROSS_ENCODER_CACHE[model_name] = None
+        return None
+    _CROSS_ENCODER_CACHE[model_name] = model
+    return model
+
+
+def apply_cross_encoder_scores(
+    query: str,
+    hits: List[Dict[str, Any]],
+    model_name: str,
+    batch_size: int = 16,
+) -> bool:
+    """
+    各 hit に rerank_score を付与する（値が大きいほどクエリとの関連が高い想定）。
+    sentence-transformers が無い場合やモデル読み込みに失敗した場合は False。
+    """
+    model = get_cross_encoder(model_name)
+    if model is None or not hits:
+        return False
+    pairs = [[query, h.get("document") or ""] for h in hits]
+    scores = model.predict(pairs, batch_size=batch_size, show_progress_bar=False)
+    if hasattr(scores, "tolist"):
+        scores = scores.tolist()
+    for h, s in zip(hits, scores):
+        h["rerank_score"] = float(s)
+    return True
+
+
 def rerank_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def sort_key(hit: Dict[str, Any]):
+        if hit.get("rerank_score") is not None:
+            return (
+                -float(hit["rerank_score"]),
+                round(float(hit.get("chroma_distance", hit["distance"])), 6),
+                -numeric_doc_priority(hit["metadata"]),
+            )
         dist = hit["distance"]
         meta = hit["metadata"]
         priority = numeric_doc_priority(meta)
-        return (round(float(dist), 3), -priority)
+        return (round(float(dist), 6), -priority)
 
     return sorted(hits, key=sort_key)
 
@@ -245,7 +327,8 @@ def apply_post_filters(
         dist = hit["distance"]
         source_type = hit.get("source_type") or meta.get("source_type") or "unknown"
 
-        if distance_cutoff is not None and dist is not None and dist > distance_cutoff:
+        dist_for_cutoff = hit.get("chroma_distance", dist)
+        if distance_cutoff is not None and dist_for_cutoff is not None and dist_for_cutoff > distance_cutoff:
             continue
 
         if source_type == "pdf":
@@ -306,6 +389,9 @@ def retrieve_hits(
     chroma_dir: Path = CHROMA_DIR,
     ollama_base_url: str = OLLAMA_BASE_URL,
     embed_model: str = EMBED_MODEL,
+    use_cross_encoder_rerank: bool = False,
+    rerank_model: Optional[str] = None,
+    rerank_batch_size: int = 16,
 ) -> Dict[str, Any]:
     target_collections = collections or resolve_collections_for_source(source)
 
@@ -349,6 +435,19 @@ def retrieve_hits(
         raw_hits_all.extend(hits)
         searched_collections.append(collection_name)
 
+    for hit in raw_hits_all:
+        hit["chroma_distance"] = hit["distance"]
+
+    rerank_applied = False
+    if use_cross_encoder_rerank and raw_hits_all:
+        rm = (rerank_model or os.environ.get("RERANK_MODEL") or DEFAULT_RERANK_MODEL).strip()
+        rerank_applied = apply_cross_encoder_scores(
+            query=query,
+            hits=raw_hits_all,
+            model_name=rm,
+            batch_size=rerank_batch_size,
+        )
+
     reranked_hits = rerank_hits(raw_hits_all)
 
     final_hits = apply_post_filters(
@@ -369,6 +468,11 @@ def retrieve_hits(
         "searched_collections": searched_collections,
         "missing_collections": missing_collections,
         "source": normalize_source(source),
+        "rerank_requested": use_cross_encoder_rerank,
+        "rerank_applied": rerank_applied,
+        "rerank_model": (rerank_model or os.environ.get("RERANK_MODEL") or DEFAULT_RERANK_MODEL).strip()
+        if use_cross_encoder_rerank
+        else None,
     }
 
 
@@ -465,7 +569,8 @@ def build_context(final_hits: List[Dict[str, Any]]) -> str:
                 f"project_id: {meta.get('project_id', '')}",
                 f"doc_id: {meta.get('doc_id', '')}",
                 f"source_url: {meta.get('source_url', '')}",
-                f"distance: {hit.get('distance', '')}",
+                f"chroma_distance: {hit.get('chroma_distance', hit.get('distance', ''))}",
+                f"rerank_score: {hit.get('rerank_score', '')}",
                 "content:",
                 hit["document"].strip(),
             ]
@@ -478,7 +583,8 @@ def build_context(final_hits: List[Dict[str, Any]]) -> str:
                 f"tags: {meta.get('tags', '')}",
                 f"heading: {meta.get('heading', '') or meta.get('section_title', '')}",
                 f"url: {meta.get('url', '') or meta.get('source_url', '')}",
-                f"distance: {hit.get('distance', '')}",
+                f"chroma_distance: {hit.get('chroma_distance', hit.get('distance', ''))}",
+                f"rerank_score: {hit.get('rerank_score', '')}",
                 "content:",
                 hit["document"].strip(),
             ]
@@ -487,7 +593,8 @@ def build_context(final_hits: List[Dict[str, Any]]) -> str:
                 f"[Source {i}]",
                 f"source_type: {source_type}",
                 f"title: {meta.get('title', '')}",
-                f"distance: {hit.get('distance', '')}",
+                f"chroma_distance: {hit.get('chroma_distance', hit.get('distance', ''))}",
+                f"rerank_score: {hit.get('rerank_score', '')}",
                 "content:",
                 hit["document"].strip(),
             ]

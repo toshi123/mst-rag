@@ -13,6 +13,10 @@ dependencies:
       - chromadb
       - pymupdf
       - pymupdf4llm
+      - tiktoken
+      - sentence-transformers
+      # transformers が画像系サブモジュールを import する際に torchvision を要求することがある（リランク利用時など）
+      - torchvision
       - mcp
       - google-api-python-client
       - google-auth

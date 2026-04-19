@@ -26,10 +26,12 @@ REQUIRED_COLUMNS = [
 
 ALLOWED_FORMATS = {"Title", "Poster", "Report"}
 
-# すでに整っているファイル名の判定
+# すでに整っているファイル名の判定（先頭の西暦は ASCII 数字4桁のみ）
+# Python の \\d は全角数字などもマッチするため [0-9]{4} に固定する。
 # 例: 2025_Report_田中太郎_研究タイトル_01.pdf
+# ２０２５_Report_... のように全角年のみの名前は未統一とみなしリネーム対象にする。
 ALREADY_RENAMED_PATTERN = re.compile(
-    r"^\d{4}_(Title|Poster|Report)_.+?_\d{2}\.[^.]+$"
+    r"^[0-9]{4}_(Title|Poster|Report)_.+?_[0-9]{2}\.[^.]+$"
 )
 
 
@@ -178,6 +180,14 @@ def is_already_renamed(name: str) -> bool:
     return bool(ALREADY_RENAMED_PATTERN.match(name))
 
 
+def filename_has_untitled_placeholder(name: str) -> bool:
+    """
+    欠損メタで sanitize により付いた untitled を含むファイル名は、
+    TSV を埋めたあとに改めてリネームできる対象とする。
+    """
+    return "untitled" in normalize_text(name).lower()
+
+
 def backup_tsv(path: Path) -> Path:
     backup_path = path.with_suffix(path.suffix + ".bak")
     shutil.copy2(path, backup_path)
@@ -226,8 +236,10 @@ def rename_files_for_row(
             new_names.append(old_name)
             continue
 
-        # すでに整っている名前ならそのまま
-        if is_already_renamed(old_path.name):
+        # すでに整っている名前ならそのまま（untitled を含む場合はメタ更新のため再計算する）
+        if is_already_renamed(old_path.name) and not filename_has_untitled_placeholder(
+            old_path.name
+        ):
             logs.append(f"NO_RENAME_NEEDED: {old_path.name}")
             new_names.append(old_path.name)
             continue
@@ -242,6 +254,11 @@ def rename_files_for_row(
             suffix=suffix,
         )
         new_path = archive_dir / new_name
+
+        if new_name == old_path.name:
+            logs.append(f"NO_RENAME_NEEDED: {old_path.name}")
+            new_names.append(old_path.name)
+            continue
 
         # 同名で既に存在するなら、そのファイルが自分自身でなければ危険なのでスキップ
         if new_path.exists():

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import functools
 import hashlib
 import re
 import unicodedata
@@ -15,6 +16,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import chromadb
 import pymupdf4llm
 import requests
+import tiktoken
 from tqdm import tqdm
 
 
@@ -33,9 +35,14 @@ EMBED_MODEL = "embeddinggemma"
 
 SOURCE_FILENAME_COL = "ソースのファイル名"
 
-MIN_CHUNK_CHARS = 300
-TARGET_CHUNK_CHARS = 1200
-MAX_CHUNK_CHARS = 1600
+# チャンク長は tiktoken（既定 cl100k_base）で数える。埋め込みモデルの実トークナイザとは一致しないが、
+# 長さの目安として安定させるため使う。
+ENCODING_NAME = "cl100k_base"
+
+MIN_CHUNK_TOKENS = 128
+TARGET_CHUNK_TOKENS = 400
+MAX_CHUNK_TOKENS = 550
+OVERLAP_TOKENS = 80
 
 # 同一文書内の重複抑制
 NEAR_DUPLICATE_SIMILARITY = 0.92
@@ -288,53 +295,188 @@ def split_paragraphs(text: str) -> List[str]:
     return [p for p in paragraphs if p]
 
 
+@functools.lru_cache(maxsize=1)
+def get_token_encoder() -> tiktoken.Encoding:
+    return tiktoken.get_encoding(ENCODING_NAME)
+
+
+def count_tokens(text: str, enc: tiktoken.Encoding) -> int:
+    if not text:
+        return 0
+    return len(enc.encode(text))
+
+
+def split_into_sentences(text: str) -> List[str]:
+    text = text.strip()
+    if not text:
+        return []
+    parts = re.split(r"(?<=[。．！？!?])\s+|(?<=[.!?])\s+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def split_tokens_hard(
+    text: str,
+    max_tokens: int,
+    overlap_tokens: int,
+    enc: tiktoken.Encoding,
+) -> List[str]:
+    ids = enc.encode(text)
+    if len(ids) <= max_tokens:
+        return [text]
+    stride = max_tokens - overlap_tokens
+    if stride <= 0:
+        stride = max(1, max_tokens // 2)
+    out: List[str] = []
+    i = 0
+    while i < len(ids):
+        chunk_ids = ids[i : i + max_tokens]
+        out.append(enc.decode(chunk_ids))
+        i += stride
+    return out
+
+
+def extract_tail_for_overlap(text: str, overlap_tokens: int, enc: tiktoken.Encoding) -> str:
+    if overlap_tokens <= 0 or not text.strip():
+        return ""
+    sents = split_into_sentences(text)
+    if len(sents) > 1:
+        acc: List[str] = []
+        tok = 0
+        for s in reversed(sents):
+            acc.append(s)
+            tok += count_tokens(s, enc)
+            if tok >= overlap_tokens:
+                break
+        return "\n\n".join(reversed(acc))
+    ids = enc.encode(text)
+    if len(ids) <= overlap_tokens:
+        return text
+    return enc.decode(ids[-overlap_tokens:])
+
+
+def merge_chunks_with_overlap(
+    chunks: List[str],
+    overlap_tokens: int,
+    max_tokens: int,
+    enc: tiktoken.Encoding,
+) -> List[str]:
+    if not chunks or overlap_tokens <= 0:
+        return chunks
+    out: List[str] = [chunks[0]]
+    for nxt in chunks[1:]:
+        tail = extract_tail_for_overlap(out[-1], overlap_tokens, enc)
+        merged = f"{tail}\n\n{nxt}".strip() if tail else nxt
+        if count_tokens(merged, enc) > max_tokens:
+            merged_ids = enc.encode(merged)[:max_tokens]
+            merged = enc.decode(merged_ids)
+        out.append(merged)
+    return out
+
+
+def pack_sentences_no_overlap(
+    sentences: List[str],
+    target_tokens: int,
+    max_tokens: int,
+    overlap_tokens: int,
+    enc: tiktoken.Encoding,
+) -> List[str]:
+    chunks: List[str] = []
+    i = 0
+    n = len(sentences)
+    while i < n:
+        current: List[str] = []
+        tok = 0
+        j = i
+        while j < n:
+            st = sentences[j]
+            piece_tok = count_tokens(st, enc)
+            if not current:
+                if piece_tok > max_tokens:
+                    for sub in split_tokens_hard(st, max_tokens, overlap_tokens, enc):
+                        chunks.append(sub)
+                    j += 1
+                    i = j
+                    break
+                current.append(st)
+                tok = piece_tok
+                j += 1
+                if tok >= target_tokens:
+                    break
+                continue
+            sep = count_tokens("\n\n", enc)
+            if tok + sep + piece_tok > max_tokens:
+                break
+            current.append(st)
+            tok += sep + piece_tok
+            j += 1
+            if tok >= target_tokens:
+                break
+        if current:
+            chunks.append("\n\n".join(current))
+        if j >= n and not current:
+            break
+        if not current:
+            i = max(i + 1, j)
+            continue
+        i = j
+    return chunks
+
+
 def chunk_paragraphs(
     paragraphs: List[str],
-    target_chars: int = TARGET_CHUNK_CHARS,
-    max_chars: int = MAX_CHUNK_CHARS,
-    min_chars: int = MIN_CHUNK_CHARS,
+    target_tokens: int = TARGET_CHUNK_TOKENS,
+    max_tokens: int = MAX_CHUNK_TOKENS,
+    min_tokens: int = MIN_CHUNK_TOKENS,
+    overlap_tokens: int = OVERLAP_TOKENS,
+    enc: Optional[tiktoken.Encoding] = None,
 ) -> List[str]:
     if not paragraphs:
         return []
 
+    enc = enc or get_token_encoder()
+
+    def count_joined(parts: List[str]) -> int:
+        if not parts:
+            return 0
+        return count_tokens("\n\n".join(parts), enc)
+
     chunks: List[str] = []
     current: List[str] = []
-    current_len = 0
 
     for para in paragraphs:
-        para_len = len(para)
+        para_tokens = count_tokens(para, enc)
 
-        if para_len > max_chars:
+        if para_tokens > max_tokens:
             if current:
                 chunks.append("\n\n".join(current).strip())
                 current = []
-                current_len = 0
 
-            start = 0
-            while start < para_len:
-                end = min(start + target_chars, para_len)
-                piece = para[start:end].strip()
-                if piece:
+            sents = split_into_sentences(para)
+            if len(sents) <= 1:
+                for piece in split_tokens_hard(para, max_tokens, overlap_tokens, enc):
                     chunks.append(piece)
-                start = end
+            else:
+                packed = pack_sentences_no_overlap(
+                    sents, target_tokens, max_tokens, overlap_tokens, enc
+                )
+                packed = merge_chunks_with_overlap(packed, overlap_tokens, max_tokens, enc)
+                chunks.extend(packed)
             continue
 
-        projected = current_len + (2 if current else 0) + para_len
+        projected = count_joined(current + [para]) if current else para_tokens
 
-        if current and projected > max_chars:
+        if current and projected > max_tokens:
             chunks.append("\n\n".join(current).strip())
             current = [para]
-            current_len = para_len
         else:
             current.append(para)
-            current_len = projected
 
     if current:
         chunks.append("\n\n".join(current).strip())
 
     merged: List[str] = []
     for chunk in chunks:
-        if merged and len(chunk) < min_chars:
+        if merged and count_tokens(chunk, enc) < min_tokens:
             merged[-1] = f"{merged[-1]}\n\n{chunk}".strip()
         else:
             merged.append(chunk)

@@ -39,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=GENERATE_MODEL, help="生成モデル")
     parser.add_argument("--show-context", action="store_true", help="生成に使ったコンテキストも表示")
     parser.add_argument("--json", action="store_true", help="JSONで出力")
+    parser.add_argument("--rerank", action="store_true", help="クロスエンコーダでリランク（sentence-transformers 必須）")
+    parser.add_argument("--rerank-model", default=None, help="CrossEncoder のモデル名（既定: 環境変数 RERANK_MODEL または BAAI/bge-reranker-base）")
     return parser.parse_args()
 
 
@@ -142,6 +144,9 @@ def build_json_output(
         "answer": answer,
         "hits": result["final_hits"],
         "references": refs,
+        "rerank_requested": result.get("rerank_requested"),
+        "rerank_applied": result.get("rerank_applied"),
+        "rerank_model": result.get("rerank_model"),
     }
     if context is not None:
         payload["context"] = context
@@ -166,6 +171,8 @@ def main() -> None:
         fmt=args.format,
         genre=args.genre,
         project_id=args.project_id,
+        use_cross_encoder_rerank=args.rerank,
+        rerank_model=args.rerank_model,
     )
 
     context = build_context(result["final_hits"])

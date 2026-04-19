@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-id", default=None, help="metadata filter: project_id")
     parser.add_argument("--json", action="store_true", help="JSONで出力する")
     parser.add_argument("--show-doc", action="store_true", help="本文チャンクを表示する")
+    parser.add_argument("--rerank", action="store_true", help="クロスエンコーダでリランク（sentence-transformers 必須）")
+    parser.add_argument("--rerank-model", default=None, help="CrossEncoder のモデル名")
     return parser.parse_args()
 
 
@@ -60,7 +62,9 @@ def print_human_readable(
         source_type = hit.get("source_type") or meta.get("source_type") or "unknown"
 
         print(f"[{i}] ({source_type}) {meta.get('title', '')}")
-        print(f"  distance      : {hit['distance']}")
+        print(f"  chroma_distance: {hit.get('chroma_distance', hit['distance'])}")
+        if hit.get("rerank_score") is not None:
+            print(f"  rerank_score  : {hit['rerank_score']}")
         print(f"  collection    : {hit.get('collection_name', '')}")
         print(f"  source_type   : {source_type}")
 
@@ -133,6 +137,9 @@ def build_json_output(
         "final_hit_count": len(result["final_hits"]),
         "hits": result["final_hits"],
         "references": unique_source_entries(result["final_hits"]),
+        "rerank_requested": result.get("rerank_requested"),
+        "rerank_applied": result.get("rerank_applied"),
+        "rerank_model": result.get("rerank_model"),
     }
 
 
@@ -152,6 +159,8 @@ def main() -> None:
         fmt=args.format,
         genre=args.genre,
         project_id=args.project_id,
+        use_cross_encoder_rerank=args.rerank,
+        rerank_model=args.rerank_model,
     )
 
     if args.json:

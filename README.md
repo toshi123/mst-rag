@@ -37,12 +37,15 @@ conda env update -f environment.yml --prune
 
 用途に応じて設定してください（未設定時はコード内のデフォルトが使われます）。
 
-**RAG / Streamlit（`app.py` など）**
+**RAG / Streamlit（`app.py` / `app/streamlit_app.py` など）**
 
 - `CHROMA_DIR` — Chroma の永続ディレクトリ。デフォルトは開発者マシン向けの絶対パスになっているため、**別環境では必ず自分のパスに合わせて設定**してください。
 - `CHROMA_COLLECTION` — コレクション名（既定: `esa_posts`）。
 - `OLLAMA_HOST` — Ollama のベース URL（既定: `http://localhost:11434`）。
 - `OLLAMA_EMBED_MODEL` / `OLLAMA_CHAT_MODEL` — 使用するモデル名。
+- **`RERANK_ENABLED`** — Streamlit の検索設定で「クロスエンコーダでリランク」を**既定でオンにしたい場合**に設定します。`1` のときのみ有効です。未設定または `1` 以外のときは、起動時のチェックボックスはオフです。リランクには `sentence-transformers`（およびモデル初回ダウンロード）が必要です。
+- `RERANK_MODEL` — リランク用 CrossEncoder のモデル名（省略時はコード側の既定、例: `BAAI/bge-reranker-base`）。CLI の `query_index.py` / `ask_rag.py` の `--rerank` 利用時にも参照されます。
+- **`HF_TOKEN`** — Hugging Face の[アクセストークン](https://huggingface.co/settings/tokens)。リランクで Hub からモデルを取得する際、**未設定だと「unauthenticated requests」などの警告**が出ることがあり、認証済みリクエストにするとレート制限緩和・ダウンロードの安定に役立ちます。必須ではありません。
 
 **esa 連携スクリプト（`scripts/sync_esa_to_chroma.py`, `scripts/debug_esa_mcp.py`）**
 
@@ -54,9 +57,16 @@ conda env update -f environment.yml --prune
 ```bash
 export CHROMA_DIR="/path/to/your/chroma_db"
 export OLLAMA_HOST="http://localhost:11434"
+# Streamlit でリランクを既定オンにする（起動前に設定）
+export RERANK_ENABLED=1
 ```
 
 `.env` を使う場合は、お使いのシェルや direnv などで読み込む運用にしてください（ファイル自体は Git されません）。
+
+**リランク初回時のターミナル表示について**
+
+- `BAAI/bge-reranker-base` などを初めて読み込むと、重みの読み込み進捗や `LOAD REPORT`（`roberta.embeddings.position_ids` が `UNEXPECTED` など）が表示されることがあります。後者はクロスエンコーダ用途でよくある表示で、**多くの場合は無視して問題ありません**。
+- 未認証の警告を減らしたい場合は上記 **`HF_TOKEN`** を設定してください。`rag_retrieval.py` では Hub の冗長ログを抑える設定も入れていますが、ライブラリのバージョンによっては一部メッセージが残ることがあります。
 
 ### 4. 外部サービス・データの前提
 

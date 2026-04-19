@@ -7,7 +7,9 @@ adapted for esa-mcp-server v0.7.x payload shape
 一覧 API では本文が空のことがあるため、必要時に esa_get_post で本文を取得する。
 
 Requirements:
-  pip install mcp chromadb requests
+  pip install mcp chromadb requests tiktoken
+  （チャンク分割は scripts/build_index.py と同じトークン基準・文境界・オーバーラップを利用するため、
+   同じ環境の依存が必要です）
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +29,19 @@ import chromadb
 import requests
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from build_index import (
+    MAX_CHUNK_TOKENS,
+    MIN_CHUNK_TOKENS,
+    OVERLAP_TOKENS,
+    TARGET_CHUNK_TOKENS,
+    chunk_paragraphs,
+    split_paragraphs,
+)
 
 
 # ----------------------------
@@ -289,29 +305,17 @@ class Chunk:
     chunk_index: int
 
 
-def split_large_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str]:
-    text = text.strip()
-    if len(text) <= max_chars:
-        return [text] if text else []
-
-    parts: List[str] = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_chars)
-        if end < len(text):
-            boundary = text.rfind("\n", start, end)
-            if boundary > start + max_chars // 2:
-                end = boundary
-        part = text[start:end].strip()
-        if part:
-            parts.append(part)
-        if end >= len(text):
-            break
-        start = max(0, end - overlap)
-    return parts
-
-
-def chunk_markdown_by_heading(md: str, max_chars: int = 1800) -> List[Chunk]:
+def chunk_markdown_by_heading(
+    md: str,
+    target_tokens: int = TARGET_CHUNK_TOKENS,
+    max_tokens: int = MAX_CHUNK_TOKENS,
+    min_tokens: int = MIN_CHUNK_TOKENS,
+    overlap_tokens: int = OVERLAP_TOKENS,
+) -> List[Chunk]:
+    """
+    見出し単位でセクションを分け、各セクション本文は build_index.chunk_paragraphs と同じ
+    （tiktoken によるトークン基準・句読点での文分割・チャンク間オーバーラップ）で分割する。
+    """
     lines = md.splitlines()
     sections: List[Tuple[str, List[str]]] = []
     current_heading = "INTRO"
@@ -338,7 +342,14 @@ def chunk_markdown_by_heading(md: str, max_chars: int = 1800) -> List[Chunk]:
         text = "\n".join(sec_lines).strip()
         if not text:
             continue
-        for part in split_large_text(text, max_chars=max_chars):
+        paragraphs = split_paragraphs(text)
+        for part in chunk_paragraphs(
+            paragraphs,
+            target_tokens=target_tokens,
+            max_tokens=max_tokens,
+            min_tokens=min_tokens,
+            overlap_tokens=overlap_tokens,
+        ):
             chunks.append(Chunk(heading=heading, text=part, chunk_index=chunk_index))
             chunk_index += 1
 
@@ -758,7 +769,13 @@ async def run_sync(args: argparse.Namespace) -> None:
                     skipped_count += 1
                     continue
 
-                chunks = chunk_markdown_by_heading(body, max_chars=args.max_chars)
+                chunks = chunk_markdown_by_heading(
+                    body,
+                    target_tokens=args.target_tokens,
+                    max_tokens=args.max_tokens,
+                    min_tokens=args.min_tokens,
+                    overlap_tokens=args.overlap_tokens,
+                )
                 print(f"  chunks={len(chunks)}")
 
                 if not chunks:
@@ -848,7 +865,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--category-prefix", default=None)
     p.add_argument("--skip-wip", action="store_true")
     p.add_argument("--bootstrap", action="store_true")
-    p.add_argument("--max-chars", type=int, default=1800)
+    p.add_argument(
+        "--target-tokens",
+        type=int,
+        default=TARGET_CHUNK_TOKENS,
+        help=f"チャンク目標トークン数（既定: {TARGET_CHUNK_TOKENS}、build_index と同じ）",
+    )
+    p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=MAX_CHUNK_TOKENS,
+        help=f"チャンク上限トークン数（既定: {MAX_CHUNK_TOKENS}）",
+    )
+    p.add_argument(
+        "--min-tokens",
+        type=int,
+        default=MIN_CHUNK_TOKENS,
+        help=f"これ未満のチャンクは前と結合（既定: {MIN_CHUNK_TOKENS}）",
+    )
+    p.add_argument(
+        "--overlap-tokens",
+        type=int,
+        default=OVERLAP_TOKENS,
+        help=f"隣接チャンク間のオーバーラップ（既定: {OVERLAP_TOKENS}）",
+    )
     p.add_argument("--embed-batch-size", type=int, default=32)
     p.add_argument("--mcp-mode", choices=["docker", "npx"], default="docker")
     p.add_argument("--npx-command", default="npx")
